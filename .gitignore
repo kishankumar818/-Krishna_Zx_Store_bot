@@ -6,4 +6,3 @@
 __pycache__/
 *.pyc
 selftest_*.png
-bot.log
