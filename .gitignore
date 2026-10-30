@@ -1,0 +1,9 @@
+.env
+.env.local
+*.db
+*.db.bak
+*.log
+__pycache__/
+*.pyc
+selftest_*.png
+bot.log
