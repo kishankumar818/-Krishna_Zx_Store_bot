@@ -1546,3 +1546,10 @@ def main():
 
 if __name__ == "__main__":
     main()
+def main():
+    from keep_alive import start_keep_alive
+    start_keep_alive()          # ← free web service ke liye zaroori
+
+    init_db()
+    print("🚀 KRISHNA_ZX_STORE STARTING...", flush=True)
+    # ... baaki pura code same
