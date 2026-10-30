@@ -24,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("krishna_store")
 
 # ============================ CONFIG ============================
-BOT_TOKEN = "PASTE_BOT_TOKEN_HERE"
+BOT_TOKEN = "9123903438:AAFQSYK0D1sP9JFoD_9NW43em1THjK2I_jE"
 BOT_USERNAME = "@Krishna_Zx_Store_bot"
 ADMIN_ID = 8917638509
 STORE_NAME = "Krishna_Zx_Store"
