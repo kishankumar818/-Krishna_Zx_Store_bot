@@ -26,40 +26,67 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("krishna_store")
 
+
 # ============================ CONFIG ============================
-BOT_TOKEN = "9123903438:AAFQSYK0D1sP9JFoD_9NW43em1THjK2I_jE"
-BOT_USERNAME = "@Krishna_Zx_Store_bot"
-ADMIN_ID = 8917638509
-STORE_NAME = "Krishna_Zx_Store"
-STORE_DESCRIPTION = "Digital products, ek click mein payment aur turant download ✨"
-CURRENCY = "INR"
-UPI_ID = "yourname@fam"
-GMAIL_ADDRESS = "youremail@gmail.com"
-GMAIL_APP_PASSWORD = "xxxxxxxxxxxxxxxx"
-IMAP_HOST = "imap.gmail.com"
-PAYMENT_SENDERS = ["fampay", "npci", "yesbank", "axisbank", "icicibank", "hdfcbank", "sbi"]
-REQUIRE_DKIM = True
-MAIL_LOOKBACK_DAYS = 2
-EMAIL_POLL_SECONDS = 30
-EMAIL_POLL_ROUNDS = 20
-AUTO_APPROVE = True
-PAYMENT_TIMEOUT = 5 * 60
-MIN_PRICE, MAX_PRICE = 9, 999
+# Har value ka default yahin hai. Render ke Environment Variables mein
+# same naam ki value daloge to wo default ko override karegi.
+def env(key, default):
+    return os.environ.get(key, str(default))
+
+
+def env_bool(key, default):
+    return env(key, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_int(key, default):
+    try:
+        return int(env(key, default).strip())
+    except ValueError:
+        return int(default)
+
+
+def env_list(key, default):
+    return [x.strip().lower() for x in env(key, default).split(",") if x.strip()]
+
+
+BOT_TOKEN = env("BOT_TOKEN", "9123903438:AAFQSYK0D1sP9JFoD_9NW43em1THjK2I_jE")
+BOT_USERNAME = env("BOT_USERNAME", "@Krishna_Zx_Store_bot")
+ADMIN_ID = env_int("ADMIN_ID", 8917638509)
+STORE_NAME = env("STORE_NAME", "Krishna_Zx_Store")
+CURRENCY = env("CURRENCY", "INR")
+UPI_ID = env("UPI_ID", "yourname@fam")
+GMAIL_ADDRESS = env("GMAIL_ADDRESS", "youremail@gmail.com")
+GMAIL_APP_PASSWORD = env("GMAIL_APP_PASSWORD", "xxxxxxxxxxxxxxxx")
+IMAP_HOST = env("IMAP_HOST", "imap.gmail.com")
+PAYMENT_SENDERS = env_list("PAYMENT_SENDERS", "fampay,npci,yesbank,axisbank,icicibank,hdfcbank,sbi")
+REQUIRE_DKIM = env_bool("REQUIRE_DKIM", "true")
+MAIL_LOOKBACK_DAYS = env_int("MAIL_LOOKBACK_DAYS", 2)
+EMAIL_POLL_SECONDS = env_int("EMAIL_POLL_SECONDS", 30)
+EMAIL_POLL_ROUNDS = env_int("EMAIL_POLL_ROUNDS", 20)
+AUTO_APPROVE = env_bool("AUTO_APPROVE", "true")
+
+PAYMENT_TIMEOUT = 5 * 60        # QR ke baad 5 minute ka window (payment + UTR)
+COUNTDOWN_EDIT_SECONDS = 10     # QR caption ka timer itni second mein update hoga
+MIN_PRICE, MAX_PRICE = 1, 999
 SUPPORT_LINK = "http://t.me/Krishna_Zx_0"
 DATA_FILE = "store_data.json"
-# ================================================================
+# =================================================================
 
 STATUS_LABEL = {
     "awaiting_payment": "⏳ Payment pending",
     "verifying": "🔍 Verify ho raha hai",
+    "verified": "🟡 Verified (admin approve baaki)",
+    "failed": "⚠️ Verify fail",
     "approved": "✅ Approved",
     "rejected": "❌ Rejected",
     "expired": "⌛ Expired",
     "cancelled": "🚫 Cancelled",
 }
 
-DB = {"products": {}, "users": {}, "orders": {}, "pending": {}}
+DB = {"products": {}, "users": {}, "orders": {}, "pending": {}, "settings": {}}
 BG_TASKS = set()
+RUNNING_COUNTDOWN = set()
+RUNNING_VERIFY = set()
 
 
 # ===================== Data store =====================
@@ -68,7 +95,7 @@ def load_db():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, encoding="utf-8") as f:
             DB = json.load(f)
-    for key in ("products", "users", "orders", "pending"):
+    for key in ("products", "users", "orders", "pending", "settings"):
         DB.setdefault(key, {})
 
 
@@ -87,9 +114,23 @@ def money(amount):
     return f"₹{amount}" if CURRENCY == "INR" else f"{amount} {CURRENCY}"
 
 
-def utr_taken(utr):
-    return any(o.get("utr") == utr and o["status"] in ("verifying", "approved")
+def welcome_text():
+    custom = DB["settings"].get("welcome")
+    if custom:
+        return custom
+    return (f"🙏 Welcome to {STORE_NAME} 🙏\n\n"
+            "✨ Digital products yahan milenge, ek click mein payment aur turant download.\n"
+            f"🤖 {BOT_USERNAME}\n\nNiche se product choose karein:")
+
+
+def utr_used(utr):
+    return any(o.get("utr") == utr and o["status"] in ("verifying", "verified", "approved")
                for o in DB["orders"].values())
+
+
+def finish_pending(o):
+    if DB["pending"].get(str(o["user_id"])) == o["id"]:
+        DB["pending"].pop(str(o["user_id"]), None)
 
 
 def touch_user(u):
@@ -124,43 +165,62 @@ def start_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 
-# ===================== Colorful QR card =====================
-def font(size):
+# ===================== Premium QR card =====================
+def _font(size):
     try:
         return ImageFont.load_default(size=size)
     except TypeError:
         return ImageFont.load_default()
 
 
-def centered(draw, text, y, fnt, fill, width):
+def _gradient(w, h, stops):
+    img = Image.new("RGB", (w, h))
+    d = ImageDraw.Draw(img)
+    for y in range(h):
+        t = y / (h - 1)
+        color = stops[-1][1]
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t0 <= t <= t1:
+                k = (t - t0) / (t1 - t0)
+                color = tuple(int(c0[i] + (c1[i] - c0[i]) * k) for i in range(3))
+                break
+        d.line([(0, y), (w, y)], fill=color)
+    return img
+
+
+def _center(draw, text, y, fnt, fill, width):
     l, _, r, _ = draw.textbbox((0, 0), text, font=fnt)
     draw.text(((width - (r - l)) // 2, y), text, font=fnt, fill=fill)
 
 
 def make_qr_card(upi_link, amount, order_id):
-    qr = qrcode.QRCode(box_size=8, border=3)
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=2)
     qr.add_data(upi_link)
     qr.make(fit=True)
-    qr_img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    qr_img = qr.make_image(fill_color="#1a1033", back_color="white").convert("RGB")
+    qr_img = qr_img.resize((560, 560), Image.NEAREST)
 
-    pad = 40
-    width = qr_img.width + pad * 2
-    height = qr_img.height + 330
-    card = Image.new("RGB", (width, height), (255, 243, 224))
+    W, H = 800, 1180
+    card = _gradient(W, H, [(0.0, (88, 24, 169)), (0.5, (233, 30, 99)), (1.0, (255, 152, 0))])
     draw = ImageDraw.Draw(card)
-    draw.rectangle([0, 0, width - 1, height - 1], outline=(255, 87, 34), width=16)
-    draw.rectangle([16, 16, width - 17, 96], fill=(33, 150, 243))
-    centered(draw, STORE_NAME, 40, font(34), "white", width)
-    draw.rounded_rectangle([pad - 12, 118, width - pad + 12, 118 + qr_img.height + 24],
-                           radius=20, fill="white", outline=(156, 39, 176), width=6)
-    card.paste(qr_img, (pad, 130))
 
-    y = 130 + qr_img.height + 40
-    draw.rounded_rectangle([pad, y, width - pad, y + 60], radius=18, fill=(76, 175, 80))
-    centered(draw, f"Pay: {amount} {CURRENCY}", y + 12, font(32), "white", width)
-    centered(draw, f"Order: {order_id}", y + 85, font(22), (0, 0, 0), width)
-    centered(draw, "Scan karke payment karein, phir UTR bhejein",
-             y + 125, font(20), (156, 39, 176), width)
+    _center(draw, STORE_NAME.replace("_", " "), 45, _font(46), (255, 255, 255), W)
+    _center(draw, "SCAN & PAY", 108, _font(26), (255, 235, 59), W)
+
+    # white QR panel with shadow
+    draw.rounded_rectangle([102, 184, 722, 804], radius=36, fill=(55, 10, 90))
+    draw.rounded_rectangle([90, 170, 710, 790], radius=36, fill=(255, 255, 255),
+                           outline=(255, 235, 59), width=8)
+    card.paste(qr_img, (120, 200))
+
+    # amount pill
+    symbol = "Rs" if CURRENCY == "INR" else CURRENCY
+    draw.rounded_rectangle([180, 830, 620, 920], radius=45, fill=(0, 200, 83))
+    _center(draw, f"{symbol} {amount}", 850, _font(50), (255, 255, 255), W)
+
+    _center(draw, f"Order: {order_id}", 955, _font(30), (255, 255, 255), W)
+    _center(draw, f"UPI: {UPI_ID}", 1010, _font(26), (255, 255, 255), W)
+    _center(draw, "Payment ke baad 12-digit UTR bhejein", 1080, _font(24), (255, 235, 59), W)
 
     buf = io.BytesIO()
     card.save(buf, format="PNG")
@@ -197,7 +257,7 @@ def evaluate_mail(msg, order):
     if not sender:
         return False, f"sender allowed nahi ({domain or 'unknown'})"
 
-    auth = " ".join(msg.get_all("Authentication-Results", None) or []).lower()
+    auth = " ".join(msg.get_all("Authentication-Results", []) or []).lower()
     if REQUIRE_DKIM and not ("dkim=pass" in auth and sender in auth):
         return False, "DKIM verify nahi hua (fake mail ho sakta hai)"
 
@@ -254,18 +314,18 @@ def home_markup(uid):
     return M(rows)
 
 
-def home_text():
-    return (f"🙏 Welcome to {STORE_NAME} 🙏\n\n{STORE_DESCRIPTION}\n"
-            f"🤖 {BOT_USERNAME}\n\nNiche se product choose karein:")
-
-
 def admin_menu():
     return M([
         [B("➕ Add Product", callback_data="adm_add")],
         [B("📦 Products", callback_data="adm_products"), B("👥 Users", callback_data="adm_users")],
         [B("🧾 Orders", callback_data="adm_orders")],
+        [B("✏️ Welcome Text", callback_data="adm_welcome")],
         [B("⬅️ Back", callback_data="home")],
     ])
+
+
+def cancel_kb(oid):
+    return M([[B("❌ Order cancel karein", callback_data=f"cancel:{oid}")]])
 
 
 def admin_decision_kb(oid):
@@ -282,7 +342,7 @@ def admin_order_text(o, status_line):
             f"User ID: {o['user_id']}\n"
             f"Product: {o['product_name']}\n"
             f"Amount: {money(o['amount'])}\n"
-            f"UTR: {o['utr']}\n\n"
+            f"UTR: {o['utr'] or '-'}\n\n"
             f"Status: {status_line}")
 
 
@@ -290,6 +350,14 @@ def product_text(p):
     state = "Active ✅" if p["active"] else "Hidden ⏸"
     return (f"📦 {p['name']}\n💰 {money(p['price'])}\n🔗 {p['link']}\n"
             f"📌 Status: {state}\n📅 Added: {p['created']}")
+
+
+def caption_for(o, remaining):
+    mins, secs = divmod(max(remaining, 0), 60)
+    return (f"🧾 {o['product_name']} - {money(o['amount'])}\n"
+            f"⏳ Time bacha: {mins:02d}:{secs:02d}\n\n"
+            "Payment ke baad 12-digit UTR is chat mein bhejein.\n"
+            "Galat UTR bhejne par sahi UTR dobara bhej sakte hain.")
 
 
 def user_card(uid):
@@ -332,7 +400,10 @@ async def send_profile(bot, chat_id, uid, caption, markup=None):
 async def reply_or_edit(update, text, markup=None):
     q = update.callback_query
     if q:
-        await q.answer()
+        try:
+            await q.answer()
+        except BadRequest:
+            pass
         try:
             await q.edit_message_text(text, reply_markup=markup)
             return
@@ -348,84 +419,166 @@ def remember(update):
     return update.effective_user
 
 
-# ===================== Admin: update admin message =====================
-async def update_admin(bot, oid, status_line):
-    o = DB["orders"][oid]
-    if not o.get("admin_msg_id"):
+# ===================== Caption & admin notify helpers =====================
+async def set_caption(bot, o, caption, markup=None):
+    if not o.get("qr_msg_id"):
         return
-    markup = admin_decision_kb(oid) if o["status"] == "verifying" else None
     try:
-        await bot.edit_message_text(
-            chat_id=ADMIN_ID, message_id=o["admin_msg_id"],
-            text=admin_order_text(o, status_line), reply_markup=markup)
+        await bot.edit_message_caption(
+            chat_id=o["user_id"], message_id=o["qr_msg_id"],
+            caption=caption[:1000], reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("Caption edit failed: %s", e)
     except Exception as e:
-        log.warning("Admin message edit failed: %s", e)
+        log.warning("Caption edit failed: %s", e)
 
 
+async def notify_admin(bot, oid, status_line):
+    o = DB["orders"][oid]
+    markup = admin_decision_kb(oid) if o["status"] in ("verifying", "verified", "failed") else None
+    text = admin_order_text(o, status_line)
+    try:
+        if o.get("admin_msg_id"):
+            await bot.edit_message_text(chat_id=ADMIN_ID, message_id=o["admin_msg_id"],
+                                        text=text, reply_markup=markup)
+        else:
+            msg = await bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=markup)
+            o["admin_msg_id"] = msg.message_id
+            save_db()
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("Admin message update failed: %s", e)
+    except Exception as e:
+        log.error("Admin ko message nahi gaya: %s (admin ne bot ko /start kiya hai?)", e)
+
+
+# ===================== Timer (5 minute, live) =====================
+async def countdown(bot, oid):
+    if oid in RUNNING_COUNTDOWN:
+        return
+    RUNNING_COUNTDOWN.add(oid)
+    try:
+        while True:
+            o = DB["orders"].get(oid)
+            if not o or o["status"] != "awaiting_payment":
+                return
+            remaining = int(o["expires"] - time.time())
+            if remaining <= 0:
+                o["status"] = "expired"
+                finish_pending(o)
+                save_db()
+                await set_caption(bot, o, "⌛ Time khatam. Ye order expire ho gaya, naya order karein.", None)
+                return
+            await set_caption(bot, o, caption_for(o, remaining), cancel_kb(oid))
+            await asyncio.sleep(min(COUNTDOWN_EDIT_SECONDS, max(remaining, 1)))
+    finally:
+        RUNNING_COUNTDOWN.discard(oid)
+
+
+# ===================== Verify & approve =====================
 async def approve(bot, oid, by):
     o = DB["orders"][oid]
-    if o["status"] != "verifying":
+    if o["status"] not in ("verifying", "verified", "failed"):
         return
-    prod = DB["products"].get(o["product_id"], {})
-    o.update(status="approved", approved_at=now_str(), link=prod.get("link", ""), approved_by=by)
+    o.update(status="approved", approved_at=now_str(), approved_by=by)
+    finish_pending(o)
     save_db()
+
+    await set_caption(bot, o, f"✅ Payment verify ho gaya!\n🧾 {o['product_name']}", None)
+    markup = M([[B("⬇️ Download", url=o["link"])]]) if o.get("link") else None
     try:
         await bot.send_message(
             chat_id=o["user_id"],
             text=(f"✅ Payment verify ho gaya!\n\n🎁 {o['product_name']}\n"
                   "⬇️ Download button niche hai.\nYe link 🔗 My Link mein bhi milega."),
-            reply_markup=M([[B("⬇️ Download", url=o["link"])]]) if o["link"] else None)
+            reply_markup=markup)
     except Exception as e:
         log.error("User ko product message nahi gaya: %s", e)
         by += " (user ko message nahi gaya)"
-    await update_admin(bot, oid, f"✅ APPROVED - {by}")
+    await notify_admin(bot, oid, f"✅ APPROVED - {by}")
 
 
 async def reject(bot, oid, by):
     o = DB["orders"][oid]
-    if o["status"] != "verifying":
+    if o["status"] not in ("verifying", "verified", "failed"):
         return
     o["status"] = "rejected"
+    finish_pending(o)
     save_db()
+    await set_caption(bot, o, "❌ Ye payment verify nahi ho paya.", None)
     try:
         await bot.send_message(
             chat_id=o["user_id"],
             text=f"❌ Payment verify nahi ho paya. Support se contact karein: {SUPPORT_LINK}")
     except Exception as e:
         log.error("User ko reject message nahi gaya: %s", e)
-    await update_admin(bot, oid, f"❌ REJECTED - {by}")
+    await notify_admin(bot, oid, f"❌ REJECTED - {by}")
+
+
+async def utr_not_matched(bot, oid):
+    o = DB["orders"][oid]
+    if o["status"] != "verifying":
+        return
+    bad_utr = o["utr"]
+    o.setdefault("wrong_utrs", []).append(bad_utr)
+
+    if time.time() < o["expires"]:
+        # Abhi time bacha hai: user ko sahi UTR dobara bhejne do
+        o.update(status="awaiting_payment", utr=None)
+        save_db()
+        await bot.send_message(
+            chat_id=o["user_id"],
+            text=(f"❌ UTR {bad_utr} ki payment mail nahi mili.\n"
+                  "Payment app mein sahi 12-digit UTR dekh kar dobara bhejein. Timer chal raha hai ⏳"))
+        spawn(countdown(bot, oid))
+    else:
+        o["status"] = "failed"
+        save_db()
+        await set_caption(bot, o, "⚠️ Payment verify nahi ho paya. Admin ko details bhej di gayi hain.", None)
+        try:
+            await bot.send_message(
+                chat_id=o["user_id"],
+                text=f"⚠️ Payment verify nahi ho paya. Support se contact karein: {SUPPORT_LINK}")
+        except Exception as e:
+            log.error("User ko fail message nahi gaya: %s", e)
+        await notify_admin(bot, oid, f"⚠️ Auto verify fail: {o.get('verify_note', '')}\n"
+                                     "Approve (verified ho to), Force Approve ya Reject karein.")
 
 
 async def verify_loop(bot, oid):
-    o = DB["orders"][oid]
-    for rnd in range(1, EMAIL_POLL_ROUNDS + 1):
-        if o["status"] != "verifying":
-            return
-        ok, note = await asyncio.to_thread(check_gmail, o)
-        o["verify_note"] = note
-        save_db()
-        if ok:
-            o["verified"] = True
+    if oid in RUNNING_VERIFY:
+        return
+    RUNNING_VERIFY.add(oid)
+    try:
+        o = DB["orders"][oid]
+        for rnd in range(1, EMAIL_POLL_ROUNDS + 1):
+            if o["status"] != "verifying":
+                return
+            ok, note = await asyncio.to_thread(check_gmail, o)
+            o["verify_note"] = note
             save_db()
-            if AUTO_APPROVE:
-                await approve(bot, oid, "AUTO (Gmail verified)")
-            else:
-                await update_admin(bot, oid, f"✅ Gmail verified: {note}\nAb Approve dabayein.")
-            return
-        if rnd < EMAIL_POLL_ROUNDS:
-            await update_admin(bot, oid, f"⏳ Gmail check {rnd}/{EMAIL_POLL_ROUNDS}: {note}")
-            await asyncio.sleep(EMAIL_POLL_SECONDS)
-
-    await update_admin(
-        bot, oid,
-        f"⚠️ Auto verify fail: {o.get('verify_note', '')}\n"
-        "Approve (sirf verified hone par), Force Approve ya Reject karein.")
+            if ok:
+                o["verified"] = True
+                save_db()
+                if AUTO_APPROVE:
+                    await approve(bot, oid, "AUTO (Gmail verified)")
+                else:
+                    o["status"] = "verified"
+                    save_db()
+                    await notify_admin(bot, oid, f"✅ Gmail verified: {note}\nApprove dabayein.")
+                return
+            if rnd < EMAIL_POLL_ROUNDS:
+                await asyncio.sleep(EMAIL_POLL_SECONDS)
+        await utr_not_matched(bot, oid)
+    finally:
+        RUNNING_VERIFY.discard(oid)
 
 
 # ===================== User side =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = remember(update)
-    await update.message.reply_text(home_text(), reply_markup=home_markup(user.id))
+    await update.message.reply_text(welcome_text(), reply_markup=home_markup(user.id))
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -475,24 +628,27 @@ async def show_product(update, context, pid):
 
 async def create_order(update, context, pid):
     q = update.callback_query
-    await q.answer()
     user = q.from_user
     prod = DB["products"].get(pid)
     if not prod or not prod["active"]:
-        return await q.message.chat.send_message("❌ Ye product abhi available nahi hai.")
+        return await q.answer("Ye product abhi available nahi hai.", show_alert=True)
+    await q.answer()
 
-    old = DB["pending"].pop(str(user.id), None)
-    if old and DB["orders"].get(old, {}).get("status") == "awaiting_payment":
-        DB["orders"][old]["status"] = "cancelled"
+    old_id = DB["pending"].pop(str(user.id), None)
+    if old_id:
+        old = DB["orders"].get(old_id)
+        if old and old["status"] == "awaiting_payment":
+            old["status"] = "cancelled"
+            await set_caption(context.bot, old, "🚫 Ye order cancel ho gaya (naya order bana).", None)
 
     oid = uuid.uuid4().hex[:8].upper()
     now = time.time()
     order = {
         "id": oid, "user_id": user.id, "user_name": user.full_name,
         "username": user.username or "", "product_id": pid,
-        "product_name": prod["name"], "amount": prod["price"],
+        "product_name": prod["name"], "amount": prod["price"], "link": prod["link"],
         "status": "awaiting_payment", "created": now, "created_str": now_str(),
-        "expires": now + PAYMENT_TIMEOUT, "utr": None, "link": "",
+        "expires": now + PAYMENT_TIMEOUT, "utr": None,
         "qr_msg_id": None, "admin_msg_id": None, "verified": False, "verify_note": "",
     }
     DB["orders"][oid] = order
@@ -502,14 +658,12 @@ async def create_order(update, context, pid):
     upi = (f"upi://pay?pa={UPI_ID}&pn={quote(STORE_NAME)}"
            f"&am={prod['price']}&cu={CURRENCY}&tn={oid}")
     card = make_qr_card(upi, prod["price"], oid)
-    caption = (f"🧾 {prod['name']}\n💰 {money(prod['price'])}\n"
-               f"⏳ {PAYMENT_TIMEOUT // 60} minute ke andar payment karein.\n\n"
-               "🔢 Payment ke baad 12-digit UTR is chat mein bhejein.")
     sent = await context.bot.send_photo(
-        chat_id=user.id, photo=card, caption=caption,
-        reply_markup=M([[B("❌ Order cancel karein", callback_data=f"cancel:{oid}")]]))
+        chat_id=user.id, photo=card, caption=caption_for(order, PAYMENT_TIMEOUT),
+        reply_markup=cancel_kb(oid))
     order["qr_msg_id"] = sent.message_id
     save_db()
+    spawn(countdown(context.bot, oid))
 
 
 async def cancel_order(update, context, oid):
@@ -518,28 +672,34 @@ async def cancel_order(update, context, oid):
     if not o or o["user_id"] != q.from_user.id or o["status"] != "awaiting_payment":
         return await q.answer("Ye order cancel nahi ho sakta.", show_alert=True)
     o["status"] = "cancelled"
-    DB["pending"].pop(str(q.from_user.id), None)
+    finish_pending(o)
     save_db()
     await q.answer("Order cancel ho gaya")
-    try:
-        await q.edit_message_caption(caption="🚫 Ye order cancel ho gaya. Dobara order karne ke liye product choose karein.")
-    except Exception:
-        pass
+    await set_caption(context.bot, o, "🚫 Ye order cancel ho gaya. Dobara order karne ke liye product choose karein.", None)
 
 
 async def handle_utr(update, context, oid, raw_text):
     user = update.effective_user
     o = DB["orders"].get(oid)
 
-    if not o or o["status"] != "awaiting_payment":
+    if not o:
         DB["pending"].pop(str(user.id), None)
         save_db()
+        return await update.message.reply_text("Koi active order nahi hai.", reply_markup=home_markup(user.id))
+
+    if o["status"] == "verifying":
         return await update.message.reply_text(
-            "Ye order active nahi hai. Dobara product choose karein.", reply_markup=home_markup(user.id))
+            f"⏳ Aapka UTR {o['utr']} abhi verify ho raha hai. Wait karein, dobara na bhejein.")
+
+    if o["status"] != "awaiting_payment":
+        finish_pending(o)
+        save_db()
+        return await update.message.reply_text(
+            "Ye order ab active nahi hai. Naya product choose karein.", reply_markup=home_markup(user.id))
 
     if time.time() > o["expires"]:
         o["status"] = "expired"
-        DB["pending"].pop(str(user.id), None)
+        finish_pending(o)
         save_db()
         return await update.message.reply_text(
             "⌛ Time khatam ho gaya. Naya order karein.", reply_markup=home_markup(user.id))
@@ -547,27 +707,20 @@ async def handle_utr(update, context, oid, raw_text):
     utr = re.sub(r"\s+", "", raw_text)
     if not re.fullmatch(r"\d{12}", utr):
         return await update.message.reply_text(
-            "❌ UTR galat hai. UTR 12 digit ka hota hai, sirf numbers. Payment app mein dekh kar dobara bhejein.")
+            "❌ UTR galat hai. UTR 12 digit ka hota hai, sirf numbers. "
+            "Payment app mein dekh kar sahi UTR bhejein.")
 
-    if utr_taken(utr):
+    if utr_used(utr):
         return await update.message.reply_text(
             "❌ Ye UTR pehle hi use ho chuka hai. Ek UTR dobara verify nahi hota.")
 
     o.update(utr=utr, status="verifying", utr_at=now_str())
-    DB["pending"].pop(str(user.id), None)
     save_db()
 
     await update.message.reply_text(
-        "⏳ UTR mil gaya. Payment Gmail se verify ho raha hai, thoda wait karein.")
-    try:
-        admin_msg = await context.bot.send_message(
-            chat_id=ADMIN_ID, text=admin_order_text(o, "⏳ Gmail verify ho raha hai"),
-            reply_markup=admin_decision_kb(oid))
-        o["admin_msg_id"] = admin_msg.message_id
-        save_db()
-    except Exception as e:
-        log.error("Admin ko message nahi gaya: %s (admin ne bot ko /start kiya hai?)", e)
-
+        "🔍 UTR mil gaya. Payment Gmail se verify ho raha hai. Mail aate hi product mil jayega, thoda wait karein.")
+    await set_caption(context.bot, o, f"🔍 UTR {utr} verify ho raha hai...\nKoi tension nahi, product mil jayega.", None)
+    await notify_admin(context.bot, oid, "🔍 Gmail verify ho raha hai")
     spawn(verify_loop(context.bot, oid))
 
 
@@ -595,15 +748,12 @@ async def show_mylink(update, context):
             update, "🔗 Abhi koi purchased product nahi hai.", M([[B("⬅️ Back", callback_data="home")]]))
     rows = [[B(f"⬇️ {o['product_name']}", url=o["link"])] for o in approved]
     rows.append([B("⬅️ Back", callback_data="home")])
-    await reply_or_edit(update, "🔗 Aapke purchased products. Download ke liye neeche button dabayein:", M(rows))
+    await reply_or_edit(update, "🔗 Aapke purchased products. Download ke liye button dabayein:", M(rows))
 
 
 # ===================== Admin side =====================
-async def show_admin(update, context):
-    await reply_or_edit(update, "🛠 Admin Panel", admin_menu())
-
-
 async def admin_add_start(update, context):
+    context.user_data.clear()
     context.user_data["step"] = "name"
     context.user_data["draft"] = {}
     await reply_or_edit(update, "➕ Product ka naam likhein (2 se 60 characters):",
@@ -611,7 +761,7 @@ async def admin_add_start(update, context):
 
 
 async def admin_step(update, context, text):
-    step = context.user_data["step"]
+    step = context.user_data.get("step")
     draft = context.user_data.setdefault("draft", {})
 
     if step == "name":
@@ -623,7 +773,7 @@ async def admin_step(update, context, text):
             f"💰 Price likhein ({money(MIN_PRICE)} se {money(MAX_PRICE)} ke beech, sirf number):")
 
     if step == "price":
-        digits = re.sub(r"[₹\s]", "", text)
+        digits = re.sub(r"[₹\s,]", "", text)
         if not digits.isdigit() or not MIN_PRICE <= int(digits) <= MAX_PRICE:
             return await update.message.reply_text(
                 f"❌ Price {money(MIN_PRICE)} se {money(MAX_PRICE)} ke beech hona chahiye.")
@@ -644,29 +794,49 @@ async def admin_step(update, context, text):
                                       B("❌ Cancel", callback_data="adm_add_cancel")]]))
 
     if step == "confirm":
-        return await update.message.reply_text(
-            "Upar wale buttons se Submit ya Cancel karein, ya /cancel likhein.")
+        return await update.message.reply_text("Upar wale buttons se Submit ya Cancel karein.")
+
+    if step == "welcome":
+        if not 5 <= len(text) <= 2000:
+            return await update.message.reply_text("❌ Welcome text 5 se 2000 characters ke beech hona chahiye.")
+        DB["settings"]["welcome"] = text
+        save_db()
+        context.user_data.clear()
+        return await update.message.reply_text("✅ Welcome text update ho gaya. /start karke dekhein.",
+                                               reply_markup=admin_menu())
 
 
 async def admin_products(update, context):
     rows = [[B(f"{'✅' if p['active'] else '⏸'} {p['name']} - {money(p['price'])}",
                callback_data=f"adm_prod:{pid}")]
             for pid, p in DB["products"].items()]
+    rows.append([B("➕ Add Product", callback_data="adm_add")])
     rows.append([B("⬅️ Back", callback_data="adm")])
-    text = "📦 Products (tap karke manage karein):" if rows[:-1] else "📦 Abhi koi product nahi hai."
+    text = "📦 Products (tap karke manage karein):" if DB["products"] else \
+        "📦 Abhi koi product nahi hai. Add Product dabayein."
     await reply_or_edit(update, text, M(rows))
 
 
-async def admin_product_detail(update, context, pid):
+async def admin_product_detail(update, pid):
     p = DB["products"].get(pid)
     if not p:
-        return await reply_or_edit(update, "❌ Product nahi mila.", M([[B("⬅️ Back", callback_data="adm_products")]]))
+        return await reply_or_edit(update, "❌ Product nahi mila.",
+                                   M([[B("⬅️ Back", callback_data="adm_products")]]))
     markup = M([
         [B("⏸ Hide / ▶️ Show", callback_data=f"adm_toggle:{pid}")],
-        [B("🗑 Delete", callback_data=f"adm_delete:{pid}")],
+        [B("🗑 Delete", callback_data=f"adm_del:{pid}")],
         [B("⬅️ Back", callback_data="adm_products")],
     ])
     await reply_or_edit(update, product_text(p), markup)
+
+
+async def admin_welcome(update, context):
+    text = f"✏️ Welcome text (user ko /start par dikhta hai):\n\n{welcome_text()}"
+    await reply_or_edit(update, text, M([
+        [B("✏️ Edit karein", callback_data="adm_welcome_edit")],
+        [B("🔄 Default par wapas", callback_data="adm_welcome_reset")],
+        [B("⬅️ Back", callback_data="adm")],
+    ]))
 
 
 async def admin_users(update, context):
@@ -701,8 +871,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if admin_only and user.id != ADMIN_ID:
         return await q.answer("Ye sirf admin ke liye hai", show_alert=True)
 
+    # ---- user ----
     if action == "home":
-        return await reply_or_edit(update, home_text(), home_markup(user.id))
+        return await reply_or_edit(update, welcome_text(), home_markup(user.id))
     if action == "prod":
         return await show_product(update, context, arg)
     if action == "buy":
@@ -714,9 +885,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "mylink":
         return await show_mylink(update, context)
 
+    # ---- admin: panel & product ----
     if action == "adm":
         context.user_data.clear()
-        return await show_admin(update, context)
+        return await reply_or_edit(update, "🛠 Admin Panel", admin_menu())
     if action == "adm_add":
         return await admin_add_start(update, context)
     if action == "adm_add_cancel":
@@ -733,22 +905,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         save_db()
         context.user_data.clear()
-        return await reply_or_edit(update, f"✅ Product add ho gaya!\n\n{product_text(DB['products'][pid])}",
-                                   admin_menu())
+        return await reply_or_edit(
+            update, f"✅ Product add ho gaya!\n\n{product_text(DB['products'][pid])}",
+            M([
+                [B("🗑 Delete", callback_data=f"adm_del:{pid}"),
+                 B("⏸ Hide / Show", callback_data=f"adm_toggle:{pid}")],
+                [B("➕ Add Another", callback_data="adm_add")],
+                [B("⬅️ Admin Panel", callback_data="adm")],
+            ]))
     if action == "adm_products":
         return await admin_products(update, context)
     if action == "adm_prod":
-        return await admin_product_detail(update, context, arg)
+        return await admin_product_detail(update, arg)
     if action == "adm_toggle":
         p = DB["products"].get(arg)
         if p:
             p["active"] = not p["active"]
             save_db()
-        return await admin_product_detail(update, context, arg)
-    if action == "adm_delete":
+        return await admin_product_detail(update, arg)
+    if action == "adm_del":
+        p = DB["products"].get(arg)
+        if not p:
+            return await q.answer("Product nahi mila.", show_alert=True)
+        return await reply_or_edit(
+            update, f"🗑 '{p['name']}' ko delete karna hai?\nYe user panel se hat jayega.",
+            M([[B("✅ Haan, delete", callback_data=f"adm_delok:{arg}"),
+                B("❌ Nahi", callback_data=f"adm_prod:{arg}")]]))
+    if action == "adm_delok":
         DB["products"].pop(arg, None)
         save_db()
         return await admin_products(update, context)
+
+    # ---- admin: users & orders ----
     if action == "adm_users":
         return await admin_users(update, context)
     if action == "adm_user":
@@ -771,14 +959,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "adm_orders":
         return await admin_orders(update, context)
 
+    # ---- admin: welcome text ----
+    if action == "adm_welcome":
+        return await admin_welcome(update, context)
+    if action == "adm_welcome_edit":
+        context.user_data.clear()
+        context.user_data["step"] = "welcome"
+        return await reply_or_edit(
+            update, "✏️ Naya welcome text likhein. Store ka naam, description, sab aap likh sakte ho:",
+            M([[B("❌ Cancel", callback_data="adm_welcome")]]))
+    if action == "adm_welcome_reset":
+        DB["settings"].pop("welcome", None)
+        save_db()
+        return await admin_welcome(update, context)
+
+    # ---- admin: approve / force / reject ----
     if action in ("approve", "force", "reject"):
         o = DB["orders"].get(arg)
-        if not o or o["status"] != "verifying":
+        if not o or o["status"] not in ("verifying", "verified", "failed"):
             return await q.answer("Ye order pehle hi process ho chuka hai.", show_alert=True)
         if action == "approve":
             if not o.get("verified"):
                 return await q.answer(
-                    f"Gmail verify nahi hua: {o.get('verify_note', '')}\nAgar payment confirm hai to Force dabayein.",
+                    "Gmail verify nahi hua. Agar payment confirm hai to Force Approve dabayein.",
                     show_alert=True)
             await q.answer()
             return await approve(context.bot, arg, "Admin (verified)")
@@ -807,12 +1010,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== main =====================
 async def post_init(app):
-    for oid, o in DB["orders"].items():
-        if o["status"] == "verifying":
+    # Restart ke baad adhoore kaam dobara chalu karein
+    for oid, o in list(DB["orders"].items()):
+        if o["status"] == "awaiting_payment":
+            if time.time() < o["expires"]:
+                spawn(countdown(app.bot, oid))
+            else:
+                o["status"] = "expired"
+                finish_pending(o)
+        elif o["status"] == "verifying":
             spawn(verify_loop(app.bot, oid))
+    save_db()
 
 
 def main():
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", BOT_TOKEN):
+        log.error("BOT_TOKEN sahi nahi hai. Render -> Environment mein BOT_TOKEN daalo (BotFather ka token).")
+        return
+
     load_db()
     threading.Thread(target=start_health_server, daemon=True).start()
     log.info("Health server started")
