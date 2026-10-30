@@ -1,0 +1,24 @@
+services:
+  - type: worker
+    name: krishna-zx-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python ZxStore.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: UPI_ID
+        sync: false
+      - key: GMAIL_ADDRESS
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: DB_PATH
+        value: /var/data/krishna_zx_store.db
+    disk:
+      name: bot-data
+      mountPath: /var/data
+      sizeGB: 1
