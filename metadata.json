@@ -1,0 +1,5 @@
+{
+  "name": "Krishna Zx Store 24/7 Telegram Bot",
+  "description": "24/7 Telegram digital store bot with UPI QR generation, Gmail DKIM auto-verification, self-pinging keep-alive server, and auto-restart supervisor.",
+  "requestFramePermissions": []
+}

@@ -12,16 +12,27 @@ from email.utils import parseaddr, parsedate_to_datetime
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters,
 )
 
+from keep_alive import start_keep_alive, update_bot_state
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("krishna_store")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 # ============================ CONFIG ============================
 BOT_TOKEN = "PASTE_BOT_TOKEN_HERE"
@@ -58,21 +69,9 @@ def money(amount):
     return f"{prefix}{amount}"
 
 
-# ===================== Render health check =====================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass
-
-
+# ===================== Render & 24/7 Keep-Alive =====================
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    start_keep_alive()
 
 
 # ===================== QR card (colorful box) =====================
@@ -436,24 +435,82 @@ async def admin_decision(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_admin(context.bot, order, "❌ REJECTED - Admin")
 
 
-# ===================== main =====================
-def main():
-    if ADMIN_ID == 0:
-        log.warning("ADMIN_ID set nahi hai")
-    threading.Thread(target=start_health_server, daemon=True).start()
-    log.info("Health server started")
+# ===================== 24/7 Error Handler & Auto-Restart main =====================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, RetryAfter):
+        await asyncio.sleep(err.retry_after)
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        log.warning("Network/Timeout glitch (auto-recovering): %s", err)
+        return
+    if isinstance(err, Conflict):
+        log.warning("Conflict detected: %s", err)
+        await asyncio.sleep(5)
+        return
+    if isinstance(err, BadRequest) and "not modified" in str(err).lower():
+        return
+    log.error("Unhandled bot error: %s", err, exc_info=err)
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+def build_application():
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(35.0)
+        .get_updates_write_timeout(30.0)
+        .get_updates_pool_timeout(30.0)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CallbackQueryHandler(show_products, pattern="^products$"))
     app.add_handler(CallbackQueryHandler(buy, pattern="^buy:"))
     app.add_handler(CallbackQueryHandler(admin_decision, pattern="^(approve|reject|force):"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    app.add_error_handler(on_error)
+    return app
 
-    log.info("Bot running")
-    app.run_polling(drop_pending_updates=True)
+
+def main():
+    if ADMIN_ID == 0:
+        log.warning("ADMIN_ID set nahi hai")
+    start_keep_alive()
+    log.info("24/7 Keep-alive server started")
+
+    restart_count = 0
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            app = build_application()
+            log.info("Bot running in 24/7 mode (restart #%d)", restart_count)
+            update_bot_state(status="running", restart_count=restart_count)
+            app.run_polling(
+                drop_pending_updates=True,
+                bootstrap_retries=-1,
+                timeout=30,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False,
+            )
+        except InvalidToken as e:
+            log.error("Invalid BOT_TOKEN: %s", e)
+            update_bot_state(status="invalid_token", last_error=str(e))
+            time.sleep(60)
+        except (KeyboardInterrupt, SystemExit):
+            break
+        except Exception as e:
+            restart_count += 1
+            log.error("Bot polling error (5s mein auto-restart #%d): %s", restart_count, e)
+            update_bot_state(status="restarting", restart_count=restart_count, last_error=str(e))
+            time.sleep(5)
 
 
 if __name__ == "__main__":
     main()
+

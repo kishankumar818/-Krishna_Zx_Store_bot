@@ -15,17 +15,27 @@ from email.utils import parseaddr, parsedate_to_datetime
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 import qrcode
 from PIL import Image, ImageDraw, ImageFont
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup as M, Update, BotCommand
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Conflict, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters,
 )
 
+from keep_alive import start_keep_alive, update_bot_state
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("krishna_store")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 
 # ============================ CONFIG ============================
@@ -72,7 +82,22 @@ PAYMENT_TIMEOUT = 5 * 60        # QR ke baad 5 minute ka window (payment + UTR)
 COUNTDOWN_EDIT_SECONDS = 10     # QR caption ka timer itni second mein update hoga
 MIN_PRICE, MAX_PRICE = 1, 999
 SUPPORT_LINK = "http://t.me/Krishna_Zx_0"
-DATA_FILE = "store_data.json"
+
+
+def _resolve_data_file():
+    custom_path = env("DB_PATH", "").strip()
+    if custom_path:
+        try:
+            parent = os.path.dirname(custom_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            return custom_path
+        except OSError:
+            pass
+    return "store_data.json"
+
+
+DATA_FILE = _resolve_data_file()
 IST = timezone(timedelta(hours=5, minutes=30))
 # =================================================================
 
@@ -283,21 +308,9 @@ def extract_utr(text):
     return m.group() if m else None
 
 
-# ===================== Render health check =====================
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def log_message(self, *args):
-        pass
-
-
+# ===================== Render & 24/7 Keep-Alive =====================
 def start_health_server():
-    port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
+    start_keep_alive()
 
 
 # ===================== Premium QR card =====================
@@ -1470,7 +1483,51 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👇 Menu se choose karein:", reply_markup=home_markup(user.id))
 
 
-# ===================== main =====================
+# ===================== 24/7 Heartbeat, Error Handler & Supervisor =====================
+async def heartbeat_loop(bot):
+    """Har 2 minute mein connection check aur adhoore orders resume karta hai."""
+    while True:
+        try:
+            await bot.get_me()
+            update_bot_state(
+                status="running",
+                bot_username=BOT_USERNAME,
+                store_name=STORE_NAME,
+                last_heartbeat=time.time(),
+                last_error="",
+            )
+            for oid, o in list(DB["orders"].items()):
+                if o["status"] == "awaiting_payment" and oid not in RUNNING_COUNTDOWN:
+                    spawn(countdown(bot, oid))
+                elif o["status"] == "verifying" and oid not in RUNNING_VERIFY:
+                    spawn(verify_loop(bot, oid))
+        except Exception as e:
+            log.warning("Heartbeat check warning: %s", e)
+            update_bot_state(last_error=f"Heartbeat warning: {e}")
+        await asyncio.sleep(120)
+
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, RetryAfter):
+        log.warning("Telegram flood control: sleeping %s sec", err.retry_after)
+        await asyncio.sleep(err.retry_after)
+        return
+    if isinstance(err, (TimedOut, NetworkError)):
+        log.warning("Network/Timeout glitch (auto-recovering): %s", err)
+        update_bot_state(last_error=f"Transient network glitch: {err}")
+        return
+    if isinstance(err, Conflict):
+        log.warning("Conflict detected (another instance polling): %s", err)
+        update_bot_state(last_error="Conflict: dusri jagah bot chal raha hai, waiting...")
+        await asyncio.sleep(5)
+        return
+    if isinstance(err, BadRequest) and "not modified" in str(err).lower():
+        return
+    log.error("Unhandled bot error: %s", err, exc_info=err)
+    update_bot_state(last_error=str(err))
+
+
 async def post_init(app):
     try:
         await app.bot.set_my_commands([
@@ -1484,6 +1541,14 @@ async def post_init(app):
     except Exception as e:
         log.warning("Commands set nahi hue: %s", e)
 
+    update_bot_state(
+        status="running",
+        bot_username=BOT_USERNAME,
+        store_name=STORE_NAME,
+        last_heartbeat=time.time(),
+        last_error="",
+    )
+
     # Restart ke baad adhoore kaam dobara chalu karein (expire wale countdown khud handle karega)
     for oid, o in list(DB["orders"].items()):
         if o["status"] == "awaiting_payment":
@@ -1491,18 +1556,24 @@ async def post_init(app):
         elif o["status"] == "verifying":
             spawn(verify_loop(app.bot, oid))
     save_db()
+    spawn(heartbeat_loop(app.bot))
 
 
-def main():
-    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", BOT_TOKEN):
-        log.error("BOT_TOKEN sahi nahi hai. Render -> Environment mein BOT_TOKEN daalo (BotFather ka token).")
-        return
-
-    load_db()
-    threading.Thread(target=start_health_server, daemon=True).start()
-    log.info("Health server started")
-
-    app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
+def build_application():
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(35.0)
+        .get_updates_write_timeout(30.0)
+        .get_updates_pool_timeout(30.0)
+        .build()
+    )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("profile", cmd_profile))
@@ -1513,10 +1584,65 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_error_handler(on_error)
+    return app
 
-    log.info("Bot running")
-    app.run_polling(drop_pending_updates=True)
+
+def main():
+    load_db()
+    start_keep_alive()
+    log.info("24/7 Keep-alive server & self-pinger started")
+
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]{20,}", BOT_TOKEN):
+        msg = "BOT_TOKEN sahi nahi hai. Environment mein valid BOT_TOKEN daalo (BotFather ka token)."
+        log.error(msg)
+        update_bot_state(status="waiting_for_token", last_error=msg)
+        while True:
+            time.sleep(60)
+
+    restart_count = 0
+    while True:
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            RUNNING_COUNTDOWN.clear()
+            RUNNING_VERIFY.clear()
+            BG_TASKS.clear()
+
+            app = build_application()
+            log.info("Bot polling starting (24/7 mode, restart #%d)...", restart_count)
+            update_bot_state(
+                status="running",
+                restart_count=restart_count,
+                bot_username=BOT_USERNAME,
+                store_name=STORE_NAME,
+            )
+            app.run_polling(
+                drop_pending_updates=True,
+                bootstrap_retries=-1,
+                timeout=30,
+                allowed_updates=Update.ALL_TYPES,
+                close_loop=False,
+            )
+        except InvalidToken as e:
+            msg = f"BOT_TOKEN invalid ya revoked hai ({e}). Environment variable mein sahi BOT_TOKEN set karein."
+            log.error(msg)
+            update_bot_state(status="invalid_token", last_error=msg)
+            time.sleep(60)
+        except (KeyboardInterrupt, SystemExit):
+            log.info("Bot stopping cleanly...")
+            break
+        except Exception as e:
+            restart_count += 1
+            log.error("Bot polling error (5 sec mein auto-restart #%d): %s", restart_count, e, exc_info=True)
+            update_bot_state(
+                status="restarting",
+                restart_count=restart_count,
+                last_error=f"Auto-restarting after error: {e}",
+            )
+            time.sleep(5)
 
 
 if __name__ == "__main__":
     main()
+
